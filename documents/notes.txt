@@ -1,0 +1,3 @@
+Retrieval-augmented generation combines document retrieval with a language model. A document is first converted into clean text. That text is split into smaller chunks that preserve complete sentences. Each chunk is transformed into a numerical embedding. Normalized embeddings make cosine similarity efficient in a later retrieval step.
+
+This starter project deliberately does not include a vector database or question answering. Its goal is to make the loading, chunking, and embedding stages easy to inspect. You can replace this sample file with a PDF, TXT, or DOCX file in the documents directory.

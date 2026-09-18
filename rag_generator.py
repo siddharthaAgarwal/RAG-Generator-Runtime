@@ -8,11 +8,9 @@ Examples:
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
-import sys
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,7 +36,10 @@ def collect_files(inputs: list[str]) -> list[Path]:
     for raw_path in inputs:
         path = Path(raw_path).expanduser()
         if not path.exists():
-            print(f"Warning: path not found, skipping: {path}", file=sys.stderr)
+            print(f"Warning: path not found, skipping: {path}")
+            continue
+        if path.is_file() and path.suffix.lower() not in SUPPORTED_SUFFIXES:
+            print(f"Warning: unsupported file type, skipping: {path}")
             continue
         candidates: Iterable[Path] = path.rglob("*") if path.is_dir() else (path,)
         files.extend(item.resolve() for item in candidates if item.is_file() and item.suffix.lower() in SUPPORTED_SUFFIXES)
@@ -95,19 +96,22 @@ def get_model(model_name: str = MODEL_NAME) -> SentenceTransformer:
 def make_records(file_paths: list[Path], chunk_size: int, overlap: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     records: list[dict[str, Any]] = []
     documents: list[dict[str, Any]] = []
-    for document_id, path in enumerate(file_paths):
+    for path in file_paths:
         try:
             chunks = chunk_text(extract_text(path), chunk_size, overlap)
         except Exception as error:
-            print(f"Warning: could not read {path}: {error}", file=sys.stderr)
+            print(f"Warning: could not read {path}: {error}")
             continue
+        if not chunks:
+            print(f"Warning: no extractable text, skipping: {path}")
+            continue
+        document_id = len(documents)
         source = str(path)
         documents.append({"document_id": document_id, "source": source, "chunks": len(chunks)})
         records.extend(
             {"vector_id": len(records), "document_id": document_id, "source": source, "chunk_id": chunk_id, "text": text}
             for chunk_id, text in enumerate(chunks)
         )
-        print(f"{path.name}: {len(chunks)} chunks")
     return records, documents
 
 
@@ -144,7 +148,7 @@ def load_index(index_dir: Path) -> tuple[faiss.Index, dict[str, Any]]:
     return index, metadata
 
 
-def build_index(file_paths: list[Path], index_dir: Path, chunk_size: int, overlap: int) -> None:
+def build_index(file_paths: list[Path], index_dir: Path, chunk_size: int, overlap: int) -> dict[str, Any]:
     records, documents = make_records(file_paths, chunk_size, overlap)
     if not records:
         raise RuntimeError("No text chunks were extracted. Check that documents contain selectable text.")
@@ -166,7 +170,7 @@ def build_index(file_paths: list[Path], index_dir: Path, chunk_size: int, overla
         "chunks": records,
     }
     save_index(index, metadata, index_dir)
-    print(f"Saved {len(records)} chunks from {len(documents)} document(s) to {index_dir}")
+    return metadata
 
 
 def retrieve(question: str, index_dir: Path, top_k: int) -> list[tuple[float, dict[str, Any]]]:
@@ -177,50 +181,3 @@ def retrieve(question: str, index_dir: Path, top_k: int) -> list[tuple[float, di
     scores, ids = index.search(np.ascontiguousarray(np.asarray(vector, dtype=np.float32)), min(top_k, index.ntotal))
     return [(float(score), metadata["chunks"][int(vector_id)]) for score, vector_id in zip(scores[0], ids[0]) if vector_id >= 0]
 
-
-def query_index(question: str, index_dir: Path, top_k: int) -> None:
-    results = retrieve(question, index_dir, top_k)
-    print("\nRetrieved chunks:")
-    for rank, (score, record) in enumerate(results, 1):
-        print(f"\n[{rank}] cosine similarity: {score:.4f}")
-        print(f"source: {record['source']} (document {record['document_id']}, chunk {record['chunk_id']})")
-        print(record["text"])
-    context = "\n\n---\n\n".join(
-        f"Source: {record['source']} (chunk {record['chunk_id']})\n{record['text']}" for _, record in results
-    )
-    print("\nAnswer context (pass this to your preferred LLM):\n")
-    print(context)
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Local, plain-Python RAG retrieval with FAISS HNSW.")
-    commands = parser.add_subparsers(dest="command", required=True)
-    index_command = commands.add_parser("index", help="Extract, chunk, embed, and persist one or more documents")
-    index_command.add_argument("inputs", nargs="+", help="PDF, TXT, DOCX files and/or directories")
-    index_command.add_argument("--index-dir", type=Path, default=Path("rag_index"))
-    index_command.add_argument("--chunk-size", type=int, default=900, help="Approximate characters per chunk")
-    index_command.add_argument("--overlap", type=int, default=180, help="Characters retained in successive chunks")
-    query_command = commands.add_parser("query", help="Load a saved index and retrieve matching chunks")
-    query_command.add_argument("question")
-    query_command.add_argument("--index-dir", type=Path, default=Path("rag_index"))
-    query_command.add_argument("--top-k", type=int, default=3, help="Number of relevant chunks to retrieve")
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    try:
-        if args.command == "index":
-            files = collect_files(args.inputs)
-            if not files:
-                raise FileNotFoundError("No supported PDF, TXT, or DOCX files were found.")
-            build_index(files, args.index_dir, args.chunk_size, args.overlap)
-        else:
-            query_index(args.question, args.index_dir, args.top_k)
-    except Exception as error:
-        print(f"Error: {error}", file=sys.stderr)
-        raise SystemExit(1)
-
-
-if __name__ == "__main__":
-    main()
