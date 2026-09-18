@@ -17,7 +17,14 @@ def positive_integer(value: str) -> int:
     return number
 
 
-def parse_args() -> argparse.Namespace:
+def non_negative_integer(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return number
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Index PDF, TXT, and DOCX documents locally, then retrieve relevant context."
     )
@@ -31,9 +38,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query", "-q", required=True, help="Question to search for in the index.")
     parser.add_argument("--index-dir", type=Path, default=Path("rag_index"), help="Directory containing the saved index.")
     parser.add_argument("--chunk-size", type=positive_integer, default=900, help="Approximate characters per chunk when indexing.")
-    parser.add_argument("--overlap", type=int, default=180, help="Overlapping characters between chunks when indexing.")
+    parser.add_argument("--overlap", type=non_negative_integer, default=180, help="Overlapping characters between chunks when indexing.")
     parser.add_argument("--top-k", type=positive_integer, default=3, help="Number of retrieved chunks to display.")
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.overlap >= args.chunk_size:
+        parser.error("--overlap must be smaller than --chunk-size")
+    return args
 
 
 def print_results(question: str, results: list[tuple[float, dict]]) -> None:
@@ -50,8 +60,8 @@ def print_results(question: str, results: list[tuple[float, dict]]) -> None:
     print("\n\n---\n\n".join(context_parts))
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     question = args.query.strip()
     if not question:
         print("Error: query cannot be empty.", file=sys.stderr)
