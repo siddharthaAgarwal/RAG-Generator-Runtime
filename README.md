@@ -28,21 +28,30 @@ Optional chunk controls:
 python rag_generator.py index ./documents --chunk-size 900 --overlap 180
 ```
 
-This writes three local files to `rag_index/`:
+This writes two reusable local files to `rag_index/`:
 
 - `index.faiss` — FAISS HNSW vector index
-- `chunks.json` — chunk text and source metadata
-- `config.json` — model and indexing settings
+- `metadata.json` — chunk text, vector-to-chunk mapping, per-document source information, and model/index settings
 
-Re-run `index` to replace the saved index with the supplied document set.
+Re-run `index` with any number of documents to replace the saved index with that document set. The metadata is validated against the FAISS vector count every time a query reloads it.
 
 ## Retrieve context
 
 ```bash
-python rag_generator.py query "What are the cancellation terms?" --index-dir ./rag_index
+python rag_generator.py query "What are the cancellation terms?" --index-dir ./rag_index --top-k 3
 ```
 
-The query command embeds the question, retrieves the top three chunks by cosine similarity, prints their scores and provenance, then prints an **Answer context** section. That context is deliberately kept separate from generation so it can be passed to any LLM later.
+The query command embeds the question with the same saved model setting used at indexing time, retrieves the requested number of chunks by cosine similarity, prints their scores and provenance, then prints an **Answer context** section. That context is deliberately kept separate from generation so it can be passed to any LLM later.
+
+`--chunk-size`, `--overlap`, and `--top-k` are all configurable. Within one Python process, the embedding model is cached and reused for every document and query embedding request.
+
+## End-to-end check
+
+The included regression test indexes two separate text files, reloads the real FAISS index, and verifies that source provenance remains intact. It uses a deterministic local embedding stub so this storage regression test is fast and offline:
+
+```bash
+python -m unittest tests/test_multi_document.py
+```
 
 ## Implementation notes
 

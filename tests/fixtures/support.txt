@@ -1,0 +1,3 @@
+The Acme product warranty lasts for two years from the purchase date. The warranty covers manufacturing defects but does not cover accidental damage.
+
+Customers can contact the support team by email to begin a warranty claim.

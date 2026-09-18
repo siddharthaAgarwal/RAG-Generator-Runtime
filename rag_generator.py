@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
-"""A small local RAG pipeline: ingest documents, build an index, and retrieve context.
+"""A lightweight local RAG retriever for PDF, TXT, and DOCX files.
 
 Examples:
-  python rag_generator.py index ./docs/report.pdf notes.txt --index-dir ./rag_index
-  python rag_generator.py query "What does the report say about renewals?" --index-dir ./rag_index
+  python rag_generator.py index handbook.pdf product_notes.txt --index-dir rag_index
+  python rag_generator.py query "How long is the warranty?" --index-dir rag_index --top-k 3
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
+import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import faiss
 import numpy as np
@@ -21,68 +24,59 @@ from docx import Document
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 
-
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 SUPPORTED_SUFFIXES = {".pdf", ".txt", ".docx"}
 INDEX_FILE = "index.faiss"
-CHUNKS_FILE = "chunks.json"
-CONFIG_FILE = "config.json"
+METADATA_FILE = "metadata.json"
+SCHEMA_VERSION = 1
+_MODELS: dict[str, SentenceTransformer] = {}
 
 
 def collect_files(inputs: list[str]) -> list[Path]:
-    """Return supported files from paths and recursively from directories."""
+    """Accept any number of supported files and/or directories, deduplicated by path."""
     files: list[Path] = []
     for raw_path in inputs:
         path = Path(raw_path).expanduser()
         if not path.exists():
             print(f"Warning: path not found, skipping: {path}", file=sys.stderr)
             continue
-        candidates: Iterable[Path] = path.rglob("*") if path.is_dir() else [path]
-        files.extend(candidate for candidate in candidates if candidate.is_file() and candidate.suffix.lower() in SUPPORTED_SUFFIXES)
+        candidates: Iterable[Path] = path.rglob("*") if path.is_dir() else (path,)
+        files.extend(item.resolve() for item in candidates if item.is_file() and item.suffix.lower() in SUPPORTED_SUFFIXES)
     return sorted(set(files))
 
 
 def extract_text(path: Path) -> str:
-    """Extract readable text from one supported document."""
-    suffix = path.suffix.lower()
-    if suffix == ".txt":
+    """Extract text from a single supported document."""
+    if path.suffix.lower() == ".txt":
         return path.read_text(encoding="utf-8", errors="replace")
-    if suffix == ".pdf":
+    if path.suffix.lower() == ".pdf":
         return "\n".join(page.extract_text() or "" for page in PdfReader(str(path)).pages)
-    if suffix == ".docx":
+    if path.suffix.lower() == ".docx":
         document = Document(str(path))
         paragraphs = [paragraph.text for paragraph in document.paragraphs]
-        table_text = [cell.text for table in document.tables for row in table.rows for cell in row.cells]
-        return "\n".join(paragraphs + table_text)
+        cells = [cell.text for table in document.tables for row in table.rows for cell in row.cells]
+        return "\n".join(paragraphs + cells)
     raise ValueError(f"Unsupported file type: {path}")
 
 
 def split_sentences(text: str) -> list[str]:
-    """Lightweight sentence splitting with no additional NLP download."""
     cleaned = re.sub(r"\s+", " ", text).strip()
     return [part.strip() for part in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", cleaned) if part.strip()]
 
 
-def chunk_text(text: str, chunk_size: int = 900, overlap: int = 180) -> list[str]:
-    """Create sentence-aware chunks, carrying a tail forward for context overlap."""
-    if chunk_size <= overlap:
-        raise ValueError("chunk_size must be greater than overlap")
-
+def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
+    """Create sentence-aware, overlapping chunks without an NLP framework."""
+    if chunk_size < 1 or overlap < 0 or overlap >= chunk_size:
+        raise ValueError("chunk_size must be positive and overlap must be from 0 to chunk_size - 1")
     sentences = split_sentences(text)
-    if not sentences:
-        return []
-
     chunks: list[str] = []
     current = ""
     for sentence in sentences:
-        # Split unusually long single sentences, preserving all content.
-        pieces = [sentence[i : i + chunk_size] for i in range(0, len(sentence), chunk_size)]
-        for piece in pieces:
+        for piece in (sentence[offset : offset + chunk_size] for offset in range(0, len(sentence), chunk_size)):
             candidate = f"{current} {piece}".strip()
             if current and len(candidate) > chunk_size:
                 chunks.append(current)
-                current = current[-overlap:].lstrip() if overlap else ""
-                current = f"{current} {piece}".strip()
+                current = f"{current[-overlap:]} {piece}".strip() if overlap else piece
             else:
                 current = candidate
     if current:
@@ -90,65 +84,107 @@ def chunk_text(text: str, chunk_size: int = 900, overlap: int = 180) -> list[str
     return chunks
 
 
-def load_model() -> SentenceTransformer:
-    print(f"Loading embedding model: {MODEL_NAME}")
-    return SentenceTransformer(MODEL_NAME)
+def get_model(model_name: str = MODEL_NAME) -> SentenceTransformer:
+    """Load each model only once per process for both indexing and querying."""
+    if model_name not in _MODELS:
+        print(f"Loading embedding model: {model_name}")
+        _MODELS[model_name] = SentenceTransformer(model_name)
+    return _MODELS[model_name]
+
+
+def make_records(file_paths: list[Path], chunk_size: int, overlap: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    records: list[dict[str, Any]] = []
+    documents: list[dict[str, Any]] = []
+    for document_id, path in enumerate(file_paths):
+        try:
+            chunks = chunk_text(extract_text(path), chunk_size, overlap)
+        except Exception as error:
+            print(f"Warning: could not read {path}: {error}", file=sys.stderr)
+            continue
+        source = str(path)
+        documents.append({"document_id": document_id, "source": source, "chunks": len(chunks)})
+        records.extend(
+            {"vector_id": len(records), "document_id": document_id, "source": source, "chunk_id": chunk_id, "text": text}
+            for chunk_id, text in enumerate(chunks)
+        )
+        print(f"{path.name}: {len(chunks)} chunks")
+    return records, documents
+
+
+def atomic_json_write(path: Path, payload: dict[str, Any]) -> None:
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+        temporary_path = Path(handle.name)
+    os.replace(temporary_path, path)
+
+
+def save_index(index: faiss.Index, metadata: dict[str, Any], index_dir: Path) -> None:
+    """Persist index and metadata without leaving partially written target files."""
+    index_dir.mkdir(parents=True, exist_ok=True)
+    target = index_dir / INDEX_FILE
+    temporary = index_dir / f".{INDEX_FILE}.tmp"
+    faiss.write_index(index, str(temporary))
+    os.replace(temporary, target)
+    atomic_json_write(index_dir / METADATA_FILE, metadata)
+
+
+def load_index(index_dir: Path) -> tuple[faiss.Index, dict[str, Any]]:
+    index_path, metadata_path = index_dir / INDEX_FILE, index_dir / METADATA_FILE
+    if not index_path.exists() or not metadata_path.exists():
+        raise FileNotFoundError(f"Index files are missing in {index_dir}. Run the 'index' command first.")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if metadata.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError("Unsupported metadata schema. Rebuild this index with the current program.")
+    if metadata.get("model") != MODEL_NAME:
+        raise ValueError(f"Index uses {metadata.get('model')!r}; expected {MODEL_NAME!r}.")
+    index = faiss.read_index(str(index_path))
+    if index.ntotal != len(metadata.get("chunks", [])):
+        raise ValueError("Index and metadata disagree on vector count. Rebuild the index.")
+    return index, metadata
 
 
 def build_index(file_paths: list[Path], index_dir: Path, chunk_size: int, overlap: int) -> None:
-    records: list[dict[str, object]] = []
-    for path in file_paths:
-        try:
-            text = extract_text(path)
-            chunks = chunk_text(text, chunk_size, overlap)
-            records.extend({"source": str(path.resolve()), "chunk_id": number, "text": chunk} for number, chunk in enumerate(chunks))
-            print(f"{path}: {len(chunks)} chunks")
-        except Exception as error:
-            print(f"Warning: could not read {path}: {error}", file=sys.stderr)
-
+    records, documents = make_records(file_paths, chunk_size, overlap)
     if not records:
-        raise RuntimeError("No text chunks were extracted. Check that the documents contain selectable text.")
-
-    model = load_model()
-    embeddings = model.encode([str(record["text"]) for record in records], normalize_embeddings=True, show_progress_bar=True)
+        raise RuntimeError("No text chunks were extracted. Check that documents contain selectable text.")
+    embeddings = get_model(MODEL_NAME).encode(
+        [record["text"] for record in records], normalize_embeddings=True, show_progress_bar=True
+    )
     vectors = np.ascontiguousarray(np.asarray(embeddings, dtype=np.float32))
-
-    # Inner product on unit-normalized embeddings is cosine similarity.
     index = faiss.IndexHNSWFlat(vectors.shape[1], 32, faiss.METRIC_INNER_PRODUCT)
     index.hnsw.efConstruction = 80
     index.hnsw.efSearch = 64
     index.add(vectors)
+    metadata = {
+        "schema_version": SCHEMA_VERSION,
+        "model": MODEL_NAME,
+        "created_at": datetime.now(UTC).isoformat(),
+        "chunking": {"chunk_size": chunk_size, "overlap": overlap, "unit": "characters"},
+        "index": {"type": "IndexHNSWFlat", "metric": "cosine similarity (normalized inner product)", "dimensions": int(vectors.shape[1]), "hnsw_m": 32},
+        "documents": documents,
+        "chunks": records,
+    }
+    save_index(index, metadata, index_dir)
+    print(f"Saved {len(records)} chunks from {len(documents)} document(s) to {index_dir}")
 
-    index_dir.mkdir(parents=True, exist_ok=True)
-    faiss.write_index(index, str(index_dir / INDEX_FILE))
-    (index_dir / CHUNKS_FILE).write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-    (index_dir / CONFIG_FILE).write_text(json.dumps({"model": MODEL_NAME, "chunk_size": chunk_size, "overlap": overlap, "metric": "cosine similarity (normalized inner product)"}, indent=2), encoding="utf-8")
-    print(f"Indexed {len(records)} chunks from {len(file_paths)} file(s) in {index_dir}")
+
+def retrieve(question: str, index_dir: Path, top_k: int) -> list[tuple[float, dict[str, Any]]]:
+    if top_k < 1:
+        raise ValueError("top_k must be at least 1")
+    index, metadata = load_index(index_dir)
+    vector = get_model(metadata["model"]).encode([question], normalize_embeddings=True)
+    scores, ids = index.search(np.ascontiguousarray(np.asarray(vector, dtype=np.float32)), min(top_k, index.ntotal))
+    return [(float(score), metadata["chunks"][int(vector_id)]) for score, vector_id in zip(scores[0], ids[0]) if vector_id >= 0]
 
 
 def query_index(question: str, index_dir: Path, top_k: int) -> None:
-    index_path, chunks_path = index_dir / INDEX_FILE, index_dir / CHUNKS_FILE
-    if not index_path.exists() or not chunks_path.exists():
-        raise FileNotFoundError(f"No saved index in {index_dir}. Run the 'index' command first.")
-
-    records = json.loads(chunks_path.read_text(encoding="utf-8"))
-    index = faiss.read_index(str(index_path))
-    model = load_model()
-    query_vector = model.encode([question], normalize_embeddings=True)
-    scores, ids = index.search(np.ascontiguousarray(np.asarray(query_vector, dtype=np.float32)), min(top_k, len(records)))
-
-    results = []
-    for score, record_id in zip(scores[0], ids[0]):
-        if record_id >= 0:
-            record = records[int(record_id)]
-            results.append((float(score), record))
-
+    results = retrieve(question, index_dir, top_k)
     print("\nRetrieved chunks:")
-    for rank, (score, record) in enumerate(results, start=1):
+    for rank, (score, record) in enumerate(results, 1):
         print(f"\n[{rank}] cosine similarity: {score:.4f}")
-        print(f"source: {record['source']} (chunk {record['chunk_id']})")
+        print(f"source: {record['source']} (document {record['document_id']}, chunk {record['chunk_id']})")
         print(record["text"])
-
     context = "\n\n---\n\n".join(
         f"Source: {record['source']} (chunk {record['chunk_id']})\n{record['text']}" for _, record in results
     )
@@ -158,16 +194,16 @@ def query_index(question: str, index_dir: Path, top_k: int) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Local, plain-Python RAG retrieval with FAISS HNSW.")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    index_parser = subparsers.add_parser("index", help="Extract, chunk, embed, and persist documents")
-    index_parser.add_argument("inputs", nargs="+", help="PDF, TXT, DOCX files or directories")
-    index_parser.add_argument("--index-dir", type=Path, default=Path("rag_index"))
-    index_parser.add_argument("--chunk-size", type=int, default=900, help="Approximate characters per semantic chunk")
-    index_parser.add_argument("--overlap", type=int, default=180, help="Characters carried into the next chunk")
-    query_parser = subparsers.add_parser("query", help="Retrieve relevant chunks and assemble answer context")
-    query_parser.add_argument("question")
-    query_parser.add_argument("--index-dir", type=Path, default=Path("rag_index"))
-    query_parser.add_argument("--top-k", type=int, default=3)
+    commands = parser.add_subparsers(dest="command", required=True)
+    index_command = commands.add_parser("index", help="Extract, chunk, embed, and persist one or more documents")
+    index_command.add_argument("inputs", nargs="+", help="PDF, TXT, DOCX files and/or directories")
+    index_command.add_argument("--index-dir", type=Path, default=Path("rag_index"))
+    index_command.add_argument("--chunk-size", type=int, default=900, help="Approximate characters per chunk")
+    index_command.add_argument("--overlap", type=int, default=180, help="Characters retained in successive chunks")
+    query_command = commands.add_parser("query", help="Load a saved index and retrieve matching chunks")
+    query_command.add_argument("question")
+    query_command.add_argument("--index-dir", type=Path, default=Path("rag_index"))
+    query_command.add_argument("--top-k", type=int, default=3, help="Number of relevant chunks to retrieve")
     return parser.parse_args()
 
 
